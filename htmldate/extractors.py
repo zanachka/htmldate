@@ -14,31 +14,27 @@ from functools import lru_cache
 
 # conditional imports with fallbacks for compatibility
 # coverage for date parsing
-#try:
-import dateparser  # third-party, slow
-EXTERNAL_PARSER = dateparser.DateDataParser(settings={
+try:
+    import dateparser  # third-party, slow
+    EXTERNAL_PARSER = dateparser.DateDataParser(settings={
     'PREFER_DAY_OF_MONTH': 'first', 'PREFER_DATES_FROM': 'past',
     'DATE_ORDER': 'DMY',
-})
-# allow_redetect_language=False, languages=['de', 'en'],
-#EXTERNAL_PARSER_CONFIG = {
-#    'PREFER_DAY_OF_MONTH': 'first', 'PREFER_DATES_FROM': 'past',
-#    'DATE_ORDER': 'DMY'
-#}
-#except ImportError:
-#    # try dateutil parser
-#    from dateutil.parser import parse as FULL_PARSE
-#    EXTERNAL_PARSER = None
-#    DEFAULT_PARSER_PARAMS = {'dayfirst': True, 'fuzzy': False}
-#else:
-#FULL_PARSE = DEFAULT_PARSER_PARAMS = None
+    })
+# bug: https://github.com/adbar/trafilatura/issues/56
+except (AttributeError, ImportError):
+    # try dateutil parser
+    from dateutil.parser import parse as FULL_PARSE
+    EXTERNAL_PARSER = None
+    DEFAULT_PARSER_PARAMS = {'dayfirst': True, 'fuzzy': False}
+else:
+    FULL_PARSE, DEFAULT_PARSER_PARAMS = None, None
 # iso date parsing speedup
 try:
     from ciso8601 import parse_datetime, parse_datetime_as_naive
 except ImportError:
-    #if not FULL_PARSE:
-    from dateutil.parser import parse as FULL_PARSE
-    parse_datetime = parse_datetime_as_naive = FULL_PARSE  # shortcut
+    if not FULL_PARSE:
+        from dateutil.parser import parse as FULL_PARSE
+        parse_datetime, parse_datetime_as_naive = FULL_PARSE, FULL_PARSE  # shortcut
 # potential regex speedup
 #try:
 import regex
@@ -359,10 +355,10 @@ def external_date_parser(string, outputformat):
     LOGGER.debug('send to external parser: %s', string)
     try:
         # dateparser installed or not
-        #if EXTERNAL_PARSER is not None:
-        target = EXTERNAL_PARSER.get_date_data(string)['date_obj']
-        #else:
-        #    target = FULL_PARSE(string, **DEFAULT_PARSER_PARAMS)
+        if EXTERNAL_PARSER is not None:
+            target = EXTERNAL_PARSER.get_date_data(string)['date_obj']
+        else:
+            target = FULL_PARSE(string, **DEFAULT_PARSER_PARAMS)
     # 2 types of errors possible
     except (OverflowError, ValueError):
         target = None
