@@ -3,13 +3,13 @@
 Unit tests for the htmldate library.
 """
 
-
 import datetime
 import io
 import logging
 import os
 import re
 import sys
+import time
 
 from collections import Counter
 from contextlib import redirect_stdout
@@ -41,11 +41,13 @@ from htmldate.settings import MIN_DATE
 from htmldate.utils import (
     Extractor,
     decode_response,
+    detect_encoding,
     fetch_url,
     is_dubious_html,
     load_html,
     repair_faulty_html,
 )
+import htmldate.utils
 from htmldate.validators import (
     convert_date,
     get_max_date,
@@ -102,6 +104,8 @@ def test_input():
         is not None
     )
     assert load_html("https://httpbun.com/html") is not None
+    # an already-parsed tree is returned as-is
+    assert load_html(html.fromstring("<html><body>x</body></html>")) is not None
     # encoding declaration
     assert (
         load_html(
@@ -121,6 +125,47 @@ def test_input():
     assert find_date("<" * 100) is None
     assert find_date("<html></html>", verbose=True) is None
     assert find_date("<html><body>\u0008this\xdf\n\u001f+\uffff</body></html>") is None
+
+    # out-of-range "data-utime" timestamps must not crash (return None instead)
+    for utime in ("999999999999999", "99999999999999999999", "-99999999999999"):
+        assert (
+            find_date(
+                f'<html><body><abbr class="published" data-utime="{utime}">x</abbr>'
+                "<p>filler text</p></body></html>"
+            )
+            is None
+        )
+    # a valid Unix timestamp still resolves
+    assert (
+        find_date(
+            '<html><body><abbr class="published" data-utime="1609459200">x</abbr>'
+            "</body></html>"
+        )
+        == "2021-01-01"
+    )
+    # a parseable timestamp whose date falls outside the allowed range returns None
+    assert (
+        find_date(
+            '<html><body><abbr class="published" data-utime="86400">x</abbr>'
+            "<p>filler text</p></body></html>"
+        )
+        is None
+    )
+    # data-utime resolved in original-date mode
+    assert (
+        find_date(
+            '<html><body><abbr data-utime="1438091078">x</abbr></body></html>',
+            original_date=True,
+        )
+        == "2015-07-28"
+    )
+    # abbr with a recognized class and a title attribute
+    assert (
+        find_date(
+            '<html><body><abbr class="published" title="2020-05-05">x</abbr></body></html>'
+        )
+        == "2020-05-05"
+    )
 
     # min and max date output
     assert get_min_date("2020-02-20").date() == datetime.date(2020, 2, 20)
@@ -192,6 +237,11 @@ def test_exact_date():
             '<html><head><meta property="dc:created" content="2017-09-01"/></head><body></body></html>'
         )
         == "2017-09-01"
+    )
+    # a cleaned media element (CLEANING_LIST) must not hide a nearby date
+    assert (
+        find_date("<html><body><video></video><p>2020-05-05</p></body></html>")
+        == "2020-05-05"
     )
     assert (
         find_date(
@@ -556,6 +606,16 @@ def test_exact_date():
         find_date('<html><body>"datePublished":"2018-01-04"</body></html>')
         == "2018-01-04"
     )
+    # JSON-LD script block (json_search path)
+    assert (
+        find_date(
+            '<html><head><script type="application/ld+json">'
+            '{"@type":"Article","datePublished":"2020-05-05"}</script></head>'
+            "<body>x</body></html>",
+            original_date=True,
+        )
+        == "2020-05-05"
+    )
     assert find_date("<html><body>Stand: 1.4.18</body></html>") == "2018-04-01"
 
     # free text
@@ -865,6 +925,20 @@ def test_try_date_expr():
             "发布时间: 2022-02-25 14:34", OUTPUTFORMAT, True, MIN_DATE, LATEST_POSSIBLE
         )
         == "2022-02-25"
+    )
+    # all-numeric strings without a year are not dates and must not be handed to the
+    # slow external parser (used to take ~1s each: a DoS amplifier)
+    for junk in ("1.2.3.4.5.6.7.8.9", "13.13.13.13.13.13", "13.13.13.13.99"):
+        try_date_expr.cache_clear()
+        start = time.perf_counter()
+        assert (
+            try_date_expr(junk, OUTPUTFORMAT, True, MIN_DATE, LATEST_POSSIBLE) is None
+        )
+        assert time.perf_counter() - start < 0.5
+    # a well-formed YYYYMMDD whose date is out of range is rejected (not returned)
+    try_date_expr.cache_clear()
+    assert (
+        try_date_expr("18000101", OUTPUTFORMAT, True, MIN_DATE, LATEST_POSSIBLE) is None
     )
 
 
@@ -1186,6 +1260,15 @@ def test_url():
         )
         == "2016-07-12"
     )
+    # deferred_url_extractor falls back to the URL date when the page has none
+    assert (
+        find_date(
+            "<html><body><p>Aaa, bbb.</p></body></html>",
+            url="http://example.com/category/2016/07/12/key-words",
+            deferred_url_extractor=True,
+        )
+        == "2016-07-12"
+    )
     assert (
         find_date(
             "<html><body><p>Aaa, bbb.</p></body></html>",
@@ -1418,11 +1501,58 @@ def test_search_html():
         )
         is None
     )
+    # a plain YYYY/MM candidate (no copyright) resolves to the first of the month
+    assert (
+        search_page("<html><body><p>2010/05</p></body></html>", options) == "2010-05-01"
+    )
+    # a YYYY-MM candidate older than the copyright year is skipped in favour of it
+    assert (
+        search_page(
+            "<html><body><footer>© 2021 Example.</footer><p>2018/05</p></body></html>",
+            options,
+        )
+        == "2021-01-01"
+    )
+    # a custom (mid-year) minimum date rejects a same-year but earlier copyright date
+    assert (
+        search_page(
+            "<html><body><footer>© 1995 Example Corp.</footer></body></html>",
+            Extractor(
+                True,
+                LATEST_POSSIBLE,
+                datetime.datetime(1995, 6, 1),
+                False,
+                OUTPUTFORMAT,
+            ),
+        )
+        is None
+    )
+
+
+def test_copyright_redos():
+    "A page repeating a copyright token with no year must not hang (ReDoS guard)."
+    options = Extractor(True, LATEST_POSSIBLE, MIN_DATE, False, OUTPUTFORMAT)
+    # the unbounded \D* used to backtrack quadratically here (~10s at 8000 tokens)
+    payload = "<html><body><footer>" + ("Copyright " * 8000) + "</footer></body></html>"
+    start = time.perf_counter()
+    assert search_page(payload, options) is None
+    # generous threshold: bounded form runs in well under 0.1s, unbounded took ~10s
+    assert time.perf_counter() - start < 2.0
+    # a genuine copyright year is still extracted unchanged
+    assert (
+        search_page("<html><body><p>© 2021 Example Corp</p></body></html>", options)
+        == "2021-01-01"
+    )
 
 
 def test_idiosyncrasies():
     assert (
         find_date("<html><body><p><em>Last updated: 5/5/20</em></p></body></html>")
+        == "2020-05-05"
+    )
+    # year-first form (4-digit leading group)
+    assert (
+        find_date("<html><body><p><em>Last updated: 2020/05/05</em></p></body></html>")
         == "2020-05-05"
     )
     assert (
@@ -1623,6 +1753,17 @@ def test_cli():
     with redirect_stdout(f):
         process_args(args)
     assert f.getvalue() == "https://httpbun.com/html\tNone\n"
+    # stdin path: no URL and no input file -> read stdin, write result to stdout
+    args = parse_args([])
+    stdin_html = (
+        '<html><head><meta property="article:published_time" '
+        'content="2016-07-12"/></head><body></body></html>'
+    )
+    f = io.StringIO()
+    with patch("sys.stdin", io.StringIO(stdin_html)):
+        with redirect_stdout(f):
+            process_args(args)
+    assert f.getvalue() == "2016-07-12\n"
 
 
 def test_download():
@@ -1646,6 +1787,37 @@ def test_download():
     teststring = fetch_url(url)
     assert teststring is not None
     assert cli_examine(teststring, args) is None
+
+
+def test_encoding_detection():
+    """detect_encoding handles the optional cchardet module being absent or unhelpful"""
+    data = "öäü encoding test".encode("latin-1")  # not valid UTF-8
+    # cchardet absent (optional dep not installed)
+    with patch.object(htmldate.utils, "cchardet_detect", None):
+        assert detect_encoding(data)
+    # cchardet present but returns no encoding
+    with patch.object(
+        htmldate.utils, "cchardet_detect", Mock(return_value={"encoding": None})
+    ):
+        assert detect_encoding(data)
+
+
+def test_fetch_url_errors():
+    """fetch_url error branches (mocked, no network)"""
+    # non-200 response
+    with patch(
+        "htmldate.utils.HTTP_POOL.request", return_value=Mock(status=404, data=b"x")
+    ):
+        assert fetch_url("https://example.org") is None
+    # 200 but the body is not a usable document
+    with patch(
+        "htmldate.utils.HTTP_POOL.request", return_value=Mock(status=200, data=b"")
+    ):
+        assert fetch_url("https://example.org") is None
+    # a URL input that cannot be fetched raises in load_html
+    with patch("htmldate.utils.fetch_url", return_value=None):
+        with pytest.raises(ValueError):
+            load_html("http://example.org/page")
 
 
 def test_dependencies():
@@ -1691,6 +1863,7 @@ if __name__ == "__main__":
     test_no_date()
     test_exact_date()
     test_search_html()
+    test_copyright_redos()
     test_url()
     test_approximate_url()
     test_idiosyncrasies()
@@ -1705,3 +1878,5 @@ if __name__ == "__main__":
 
     # loading functions
     test_download()
+    test_encoding_detection()
+    test_fetch_url_errors()
